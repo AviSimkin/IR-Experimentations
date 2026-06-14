@@ -26,14 +26,19 @@ class Settings:
     def from_env(cls) -> "Settings":
         """Build settings from environment variables with sensible defaults."""
         return cls(
-            java_home=os.getenv("JAVA_HOME"),
+            java_home=os.getenv(
+                "JAVA_HOME",
+                "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home",
+            ),
             jvm_heap=os.getenv("IR_JVM_HEAP", "4G"),
             pyterrier_mem=os.getenv("IR_PYTERRIER_MEM", "4G"),
             hf_model_name=os.getenv(
                 "IR_HF_MODEL",
                 "Snowflake/snowflake-arctic-embed-l-v1.5",
             ),
-            dataset_id=os.getenv("IR_DATASET", "msmarco-passage/dev/small"),
+            dataset_id=os.getenv(
+                "IR_DATASET", "msmarco-document-v2/trec-dl-2022/judged"
+            ),
             log_level=getattr(
                 logging,
                 os.getenv("IR_LOG_LEVEL", "INFO").upper(),

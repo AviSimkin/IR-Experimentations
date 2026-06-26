@@ -20,10 +20,12 @@ Three clique types (Fig. 1):
        For each document measure P, three aggregators A ∈ {geo, min, max}:
          f_{A-P}(C) = log A({P(d)}_{d∈C})
 
-       Non-web document measures:
+       Non-web document measures (all 19 features per paper §2.1):
          P_dsim(d)      = (1/|C|) Σ_{di∈C} cos_sim(d, di)  [cluster coherence]
          P_entropy(d)   = −Σ_w p(w|d) log p(w|d)            [content breadth]
          P_icompress(d) = |d|_bytes / |gzip(d)|_bytes        [content breadth]
+         P_sw1(d)       = stopwords / non-stopwords ratio     [content breadth]
+         P_sw2(d)       = fraction of INQUERY stoplist in doc [content breadth]
 
        Web-specific document measures (ClueWeb09 collections):
          P_spam(d)    = Waterloo spam score ∈ [0,1] (1 = definitely not spam)
@@ -35,8 +37,9 @@ sim(Q, d)  = initial retrieval score, softmax-normalised to (0, 1].
 cos_sim    = cosine similarity from stemmed TF-IDF vectors.
 log uses add-ε (= 1e-10) smoothing before application (paper footnote 1).
 
-Non-web default weights are proportional to the feature-importance order
-reported in Table 3 (non-web setting) of Raiber & Kurland 2013.
+Non-web default weights follow the feature-importance order from Table 3
+(non-web setting) of Raiber & Kurland 2013, using a proportional scheme:
+  w_rank = (20 - rank) / 190   (19 features, ranks 1–19, sums to 1.0)
 Web feature weights default to 0.0 (inactive); set them in the constructor
 when using ClueWeb09 collections.  All active weights should sum to 1.0.
 
@@ -176,6 +179,75 @@ def _icompress(text: str) -> float:
     return len(raw) / max(len(_gzip.compress(raw, compresslevel=6)), 1)
 
 
+# INQUERY stopword list (418 words, UMass INQUERY system, Callan et al.)
+_INQUERY_STOPS = frozenset([
+    "a", "about", "above", "according", "across", "after", "afterwards", "again",
+    "against", "albeit", "all", "almost", "alone", "along", "already", "also",
+    "although", "always", "am", "among", "amongst", "an", "and", "another",
+    "any", "anybody", "anyhow", "anyone", "anything", "anyway", "anywhere",
+    "apart", "are", "around", "as", "at", "av", "be", "became", "because",
+    "become", "becomes", "becoming", "been", "before", "beforehand", "behind",
+    "being", "below", "beside", "besides", "between", "beyond", "both", "but",
+    "by", "can", "cannot", "canst", "certain", "cf", "choose", "contrariwise",
+    "cos", "could", "cu", "day", "do", "does", "doesnt", "doing", "dost",
+    "doth", "double", "down", "dual", "during", "each", "either", "else",
+    "elsewhere", "enough", "et", "etc", "even", "ever", "every", "everybody",
+    "everyone", "everything", "everywhere", "except", "excepted", "excepting",
+    "exception", "exclude", "excluding", "exclusive", "fairly", "far", "farther",
+    "final", "first", "for", "formerly", "forth", "from", "front", "further",
+    "furthermore", "get", "go", "had", "halves", "hardly", "has", "hast",
+    "hath", "have", "he", "hence", "henceforth", "her", "here", "hereabouts",
+    "hereafter", "hereby", "herein", "hereinafter", "hereof", "hereon", "hereto",
+    "hereupon", "hers", "herself", "him", "himself", "his", "hither", "hitherto",
+    "how", "however", "howsoever", "i", "ie", "if", "in", "inasmuch", "inc",
+    "indeed", "indoors", "inside", "insomuch", "instead", "into", "inward",
+    "inwards", "is", "it", "its", "itself", "just", "kind", "kg", "km", "last",
+    "latter", "latterly", "less", "lest", "let", "like", "likely", "likewise",
+    "little", "ltd", "many", "may", "maybe", "me", "meantime", "meanwhile",
+    "might", "more", "moreover", "most", "mostly", "much", "must", "my",
+    "myself", "namely", "need", "neither", "never", "nevertheless", "next",
+    "no", "nobody", "none", "nonetheless", "noone", "nor", "not", "nothing",
+    "notwithstanding", "now", "nowadays", "nowhere", "of", "off", "often",
+    "ok", "on", "once", "only", "onto", "or", "other", "others", "otherwise",
+    "ought", "our", "ourselves", "out", "outside", "over", "own", "per",
+    "perhaps", "plenty", "provide", "quite", "rather", "really", "round",
+    "said", "same", "save", "self", "several", "shall", "she", "should",
+    "since", "so", "some", "somebody", "somehow", "someone", "something",
+    "sometime", "sometimes", "somewhere", "still", "such", "than", "that",
+    "the", "their", "them", "themselves", "then", "thence", "thenceforth",
+    "there", "thereabout", "thereafter", "thereby", "therefore", "therein",
+    "thereof", "thereon", "thereto", "thereupon", "these", "they", "this",
+    "those", "though", "through", "throughout", "thru", "thus", "till", "to",
+    "together", "too", "toward", "towards", "truly", "twice", "under", "until",
+    "unless", "unlike", "unlikely", "up", "upon", "us", "very", "via", "vs",
+    "was", "we", "well", "were", "what", "whatever", "when", "whence",
+    "whenever", "where", "whereabouts", "whereas", "wherefore", "wherein",
+    "whereof", "whereon", "whereto", "wherever", "whether", "which", "while",
+    "whilst", "who", "whoever", "whole", "whom", "whose", "why", "will",
+    "with", "within", "without", "worse", "worst", "would", "yet", "you",
+    "your", "yourself", "yourselves",
+])
+
+_N_INQUERY_STOPS = len(_INQUERY_STOPS)
+
+
+def _sw1(tokens: list[str]) -> float:
+    """P_sw1: ratio of stopwords to non-stopwords (content breadth measure)."""
+    if not tokens:
+        return 0.0
+    n_sw = sum(1 for t in tokens if t in _INQUERY_STOPS)
+    n_non = len(tokens) - n_sw
+    return float(n_sw) / float(n_non) if n_non > 0 else float(n_sw)
+
+
+def _sw2(tokens: list[str]) -> float:
+    """P_sw2: fraction of INQUERY stoplist that appears in the document."""
+    if not tokens:
+        return 0.0
+    vocab = frozenset(tokens)
+    return sum(1 for sw in _INQUERY_STOPS if sw in vocab) / _N_INQUERY_STOPS
+
+
 def url_features(url: str) -> dict[str, float]:
     """
     Compute P_urlslash and P_urllen from a document URL.
@@ -226,9 +298,10 @@ class ClustMRF:
         Missing docnos receive neutral defaults (spam=0.5, pr=0, url*=0).
         Set the corresponding weight params (w_geo_spam etc.) to non-zero
         values to activate web features.
-    w_geo_qsim … w_max_entropy : float
-        Feature weights for the 13 non-web features.
-        Default values proportional to Table 3 (non-web setting, SIGIR 2013).
+    w_geo_qsim … w_geo_sw1 : float
+        Feature weights for the 19 non-web features (all lQD, lQC, lC cliques).
+        Defaults follow the Table 3 importance ranking (non-ClueWeb) as
+        w = (20 − rank) / 190 so all 19 weights sum to 1.0.
     w_geo_spam … w_max_spam : float
         lC weights for P_spam (Waterloo spam score).  Default 0.0 (inactive).
     w_geo_pr … w_max_pr : float
@@ -245,27 +318,41 @@ class ClustMRF:
         self,
         index,
         k: int = 5,
-        n_docs: int = 100,
+        n_docs: int = 50,
         doc_features: dict | None = None,
-        # ── Non-web feature weights (Table 3, non-web setting) ───────────────
+        # ── Non-web feature weights: proportional to Table 3 importance ranks ─
+        # w_rank = (20 - rank) / 190  (19 features, sums to 1.0)
+        # Importance order (non-ClueWeb): stdv-qsim(1), max-sw2(2), geo-qsim(3),
+        #   min-sw2(4), max-sw1(5), max-qsim(6), min-dsim(7), geo-sw2(8),
+        #   min-icompress(9), min-qsim(10), min-sw1(11), geo-icompress(12),
+        #   max-dsim(13), geo-dsim(14), max-icompress(15), geo-entropy(16),
+        #   min-entropy(17), geo-sw1(18), max-entropy(19)
         # lQD
-        w_geo_qsim:      float = 0.132,
+        w_geo_qsim:      float = 0.0895,   # rank 3:  17/190
         # lQC
-        w_stdv_qsim:     float = 0.143,
-        w_max_qsim:      float = 0.121,
-        w_min_qsim:      float = 0.088,
+        w_stdv_qsim:     float = 0.1000,   # rank 1:  19/190
+        w_max_qsim:      float = 0.0737,   # rank 6:  14/190
+        w_min_qsim:      float = 0.0526,   # rank 10: 10/190
         # lC — P_dsim
-        w_min_dsim:      float = 0.110,
-        w_max_dsim:      float = 0.066,
-        w_geo_dsim:      float = 0.055,
+        w_min_dsim:      float = 0.0684,   # rank 7:  13/190
+        w_max_dsim:      float = 0.0368,   # rank 13:  7/190
+        w_geo_dsim:      float = 0.0316,   # rank 14:  6/190
         # lC — P_icompress
-        w_min_icompress: float = 0.099,
-        w_geo_icompress: float = 0.077,
-        w_max_icompress: float = 0.044,
+        w_min_icompress: float = 0.0579,   # rank 9:  11/190
+        w_geo_icompress: float = 0.0421,   # rank 12:  8/190
+        w_max_icompress: float = 0.0263,   # rank 15:  5/190
         # lC — P_entropy
-        w_geo_entropy:   float = 0.033,
-        w_min_entropy:   float = 0.022,
-        w_max_entropy:   float = 0.011,
+        w_geo_entropy:   float = 0.0211,   # rank 16:  4/190
+        w_min_entropy:   float = 0.0158,   # rank 17:  3/190
+        w_max_entropy:   float = 0.0053,   # rank 19:  1/190
+        # lC — P_sw2 (stopword list coverage — ranks 2, 4, 8)
+        w_max_sw2:       float = 0.0947,   # rank 2:  18/190
+        w_min_sw2:       float = 0.0842,   # rank 4:  16/190
+        w_geo_sw2:       float = 0.0632,   # rank 8:  12/190
+        # lC — P_sw1 (stopword ratio — ranks 5, 11, 18)
+        w_max_sw1:       float = 0.0789,   # rank 5:  15/190
+        w_min_sw1:       float = 0.0474,   # rank 11:  9/190
+        w_geo_sw1:       float = 0.0105,   # rank 18:  2/190
         # ── Web feature weights (all default 0 = inactive) ───────────────────
         # lC — P_spam (Waterloo spam score)
         w_geo_spam:      float = 0.0,
@@ -303,6 +390,12 @@ class ClustMRF:
         self.w_geo_entropy   = w_geo_entropy
         self.w_min_entropy   = w_min_entropy
         self.w_max_entropy   = w_max_entropy
+        self.w_max_sw2       = w_max_sw2
+        self.w_min_sw2       = w_min_sw2
+        self.w_geo_sw2       = w_geo_sw2
+        self.w_max_sw1       = w_max_sw1
+        self.w_min_sw1       = w_min_sw1
+        self.w_geo_sw1       = w_geo_sw1
 
         self.w_geo_spam      = w_geo_spam
         self.w_min_spam      = w_min_spam
@@ -344,12 +437,19 @@ class ClustMRF:
         raw    = np.array(top["score"].tolist(), dtype=float)
         sim_qd = np.exp(raw - raw.max())   # best doc gets 1.0
 
-        # Stemmed TF-IDF cosine similarity matrix (k-NN + P_dsim)
+        # Stemmed TF cosine similarity matrix for k-NN clustering and P_dsim.
+        # IDF is intentionally omitted (use_idf=False): IDF computed on the 50-doc
+        # pool inverts topical similarity — common topic terms get low IDF precisely
+        # because they are the terms shared by topically-related documents.
+        # Raw (L2-normalised sublinear TF) cosine matches QL-style document similarity
+        # more closely than TF-IDF and is a better proxy for the paper's LM cross-entropy.
         doc_tokens = [tokenize_and_stem(t) for t in texts]
+        # Raw (unstemmed) tokens for stopword features P_sw1, P_sw2
+        raw_tokens = [tokenize(t) for t in texts]
         k = min(self.k, n)
 
         vect = TfidfVectorizer(max_features=10_000, sublinear_tf=True,
-                               analyzer=lambda d: d)
+                               use_idf=False, analyzer=lambda d: d)
         try:
             X = vect.fit_transform(doc_tokens)
         except ValueError:
@@ -363,6 +463,8 @@ class ClustMRF:
         # Pre-compute per-doc lC measures (called once, reused across clusters)
         entropies   = np.array([_entropy(toks) for toks in doc_tokens])
         icompresses = np.array([_icompress(t)  for t in texts])
+        sw1s        = np.array([_sw1(toks) for toks in raw_tokens])
+        sw2s        = np.array([_sw2(toks) for toks in raw_tokens])
 
         # Web features: look up per-docno values for docs in this top-n set
         if self._use_web:
@@ -410,6 +512,18 @@ class ClustMRF:
             min_icompress = math.log(float(IC.min()) + EPS)
             max_icompress = math.log(float(IC.max()) + EPS)
 
+            # ── lC: P_sw1 (stopword ratio) ────────────────────────────────────
+            SW1 = sw1s[nn]
+            geo_sw1 = float(np.log(SW1 + EPS).mean())
+            min_sw1 = math.log(float(SW1.min()) + EPS)
+            max_sw1 = math.log(float(SW1.max()) + EPS)
+
+            # ── lC: P_sw2 (stopword list coverage) ───────────────────────────
+            SW2 = sw2s[nn]
+            geo_sw2 = float(np.log(SW2 + EPS).mean())
+            min_sw2 = math.log(float(SW2.min()) + EPS)
+            max_sw2 = math.log(float(SW2.max()) + EPS)
+
             score = (
                 self.w_geo_qsim      * geo_qsim      +
                 self.w_stdv_qsim     * stdv_qsim     +
@@ -423,7 +537,13 @@ class ClustMRF:
                 self.w_max_icompress * max_icompress +
                 self.w_geo_entropy   * geo_entropy   +
                 self.w_min_entropy   * min_entropy   +
-                self.w_max_entropy   * max_entropy
+                self.w_max_entropy   * max_entropy   +
+                self.w_max_sw2       * max_sw2       +
+                self.w_min_sw2       * min_sw2       +
+                self.w_geo_sw2       * geo_sw2       +
+                self.w_max_sw1       * max_sw1       +
+                self.w_min_sw1       * min_sw1       +
+                self.w_geo_sw1       * geo_sw1
             )
 
             # ── Web lC features (active only when doc_features provided) ─────

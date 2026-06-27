@@ -65,6 +65,18 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 EPS = 1e-10   # add-ε smoothing before log (paper footnote 1)
 
+# Ordered list of the 19 non-web feature names.  Index i maps to weight w_<name>
+# and to column i of the feature matrix returned by transform_features().
+FEATURE_NAMES: list[str] = [
+    'geo_qsim',                                    # lQD  (0)
+    'stdv_qsim', 'max_qsim', 'min_qsim',          # lQC  (1-3)
+    'min_dsim',  'max_dsim', 'geo_dsim',           # lC   (4-6)
+    'min_icompress', 'geo_icompress', 'max_icompress',  # lC (7-9)
+    'geo_entropy',   'min_entropy',   'max_entropy',    # lC (10-12)
+    'max_sw2',       'min_sw2',       'geo_sw2',        # lC (13-15)
+    'max_sw1',       'min_sw1',       'geo_sw1',        # lC (16-18)
+]
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -422,29 +434,28 @@ class ClustMRF:
             ]
         )
 
-    def _rerank_query(self, query: str, docs_df: pd.DataFrame) -> pd.DataFrame:
-        """Re-rank one query's results using ClustMRF cluster scoring."""
+    @property
+    def _weight_vector(self) -> np.ndarray:
+        """Return the 19 non-web weights as an array aligned with FEATURE_NAMES."""
+        return np.array([getattr(self, f'w_{name}') for name in FEATURE_NAMES])
+
+    def _extract_features_for_query(self, docs_df: pd.DataFrame) -> dict | None:
+        """Compute the 19 non-web ClustMRF features for each document in the
+        initial top-n.  Returns a dict with everything needed to score and
+        unroll the clusters, or None if the query has too few documents."""
         top  = docs_df.head(self.n_docs).copy().reset_index(drop=True)
         tail = docs_df.iloc[self.n_docs:].copy()
         n    = len(top)
         if n < 2:
-            return docs_df
+            return None
 
         texts = top["text"].fillna("").tolist()
 
         # sim(Q, d): softmax-normalise retrieval scores → (0, 1]
-        # Works for both BM25 (positive) and DirichletLM (log-prob, negative).
         raw    = np.array(top["score"].tolist(), dtype=float)
-        sim_qd = np.exp(raw - raw.max())   # best doc gets 1.0
+        sim_qd = np.exp(raw - raw.max())
 
-        # Stemmed TF cosine similarity matrix for k-NN clustering and P_dsim.
-        # IDF is intentionally omitted (use_idf=False): IDF computed on the 50-doc
-        # pool inverts topical similarity — common topic terms get low IDF precisely
-        # because they are the terms shared by topically-related documents.
-        # Raw (L2-normalised sublinear TF) cosine matches QL-style document similarity
-        # more closely than TF-IDF and is a better proxy for the paper's LM cross-entropy.
         doc_tokens = [tokenize_and_stem(t) for t in texts]
-        # Raw (unstemmed) tokens for stopword features P_sw1, P_sw2
         raw_tokens = [tokenize(t) for t in texts]
         k = min(self.k, n)
 
@@ -453,164 +464,114 @@ class ClustMRF:
         try:
             X = vect.fit_transform(doc_tokens)
         except ValueError:
-            return docs_df
+            return None
 
         Xa = X.toarray() if issparse(X) else np.array(X)
         norms = np.linalg.norm(Xa, axis=1, keepdims=True)
         norms[norms == 0] = 1e-12
-        cos_sim = (Xa / norms) @ (Xa / norms).T   # (n, n) ∈ [-1, 1]
+        cos_sim = (Xa / norms) @ (Xa / norms).T
 
-        # Pre-compute per-doc lC measures (called once, reused across clusters)
         entropies   = np.array([_entropy(toks) for toks in doc_tokens])
         icompresses = np.array([_icompress(t)  for t in texts])
         sw1s        = np.array([_sw1(toks) for toks in raw_tokens])
         sw2s        = np.array([_sw2(toks) for toks in raw_tokens])
 
-        # Web features: look up per-docno values for docs in this top-n set
-        if self._use_web:
-            docnos = top["docno"].tolist()
-            df_map = self.doc_features  # shorthand
-            spam_arr     = np.array([df_map.get(d, {}).get("spam",     0.5) for d in docnos])
-            pr_arr       = np.array([df_map.get(d, {}).get("pr",       0.0) for d in docnos])
-            urlslash_arr = np.array([df_map.get(d, {}).get("urlslash", 0.0) for d in docnos])
-            urllen_arr   = np.array([df_map.get(d, {}).get("urllen",   0.0) for d in docnos])
-
-        # Score each cluster C(d_i) and record its member indices
-        cluster_nn     = []
-        cluster_scores = np.zeros(n)
+        features   = np.zeros((n, len(FEATURE_NAMES)), dtype=float)
+        cluster_nn = []
 
         for i in range(n):
             nn = np.argsort(cos_sim[i])[::-1][:k]
             cluster_nn.append(nn)
             ki = len(nn)
 
-            # ── lQD: geo-qsim ────────────────────────────────────────────────
-            geo_qsim = float(np.log(sim_qd[nn] + EPS).mean())
-
-            # ── lQC: min / max / stdv of sim(Q, d) ───────────────────────────
             sims_nn   = sim_qd[nn]
-            min_qsim  = math.log(float(sims_nn.min())  + EPS)
-            max_qsim  = math.log(float(sims_nn.max())  + EPS)
             std_nn    = float(sims_nn.std()) if ki > 1 else 0.0
-            stdv_qsim = math.log(std_nn + EPS)
+            pdsim     = np.array([float(cos_sim[j, nn].mean()) for j in nn])
+            H, IC, SW1, SW2 = entropies[nn], icompresses[nn], sw1s[nn], sw2s[nn]
 
-            # ── lC: P_dsim — average cosine sim to all cluster members ───────
-            pdsim = np.array([float(cos_sim[j, nn].mean()) for j in nn])
-            geo_dsim = float(np.log(pdsim + EPS).mean())
-            min_dsim = math.log(float(pdsim.min()) + EPS)
-            max_dsim = math.log(float(pdsim.max()) + EPS)
+            features[i] = [
+                float(np.log(sim_qd[nn] + EPS).mean()),          # geo_qsim
+                math.log(std_nn + EPS),                           # stdv_qsim
+                math.log(float(sims_nn.max()) + EPS),             # max_qsim
+                math.log(float(sims_nn.min()) + EPS),             # min_qsim
+                math.log(float(pdsim.min()) + EPS),               # min_dsim
+                math.log(float(pdsim.max()) + EPS),               # max_dsim
+                float(np.log(pdsim + EPS).mean()),                # geo_dsim
+                math.log(float(IC.min()) + EPS),                  # min_icompress
+                float(np.log(IC + EPS).mean()),                   # geo_icompress
+                math.log(float(IC.max()) + EPS),                  # max_icompress
+                float(np.log(H + EPS).mean()),                    # geo_entropy
+                math.log(float(H.min()) + EPS),                   # min_entropy
+                math.log(float(H.max()) + EPS),                   # max_entropy
+                math.log(float(SW2.max()) + EPS),                 # max_sw2
+                math.log(float(SW2.min()) + EPS),                 # min_sw2
+                float(np.log(SW2 + EPS).mean()),                  # geo_sw2
+                math.log(float(SW1.max()) + EPS),                 # max_sw1
+                math.log(float(SW1.min()) + EPS),                 # min_sw1
+                float(np.log(SW1 + EPS).mean()),                  # geo_sw1
+            ]
 
-            # ── lC: P_entropy ─────────────────────────────────────────────────
-            H = entropies[nn]
-            geo_entropy = float(np.log(H + EPS).mean())
-            min_entropy = math.log(float(H.min()) + EPS)
-            max_entropy = math.log(float(H.max()) + EPS)
+        return {
+            'features':   features,    # (n, 19) float64
+            'cluster_nn': cluster_nn,  # list of length n, each an int array of size k
+            'sim_qd':     sim_qd,      # (n,) softmax-normalised query-doc similarities
+            'top':        top,         # DataFrame, first n_docs rows (already copied)
+            'tail':       tail,        # DataFrame, rows beyond n_docs
+            'n':          n,
+        }
 
-            # ── lC: P_icompress ───────────────────────────────────────────────
-            IC = icompresses[nn]
-            geo_icompress = float(np.log(IC + EPS).mean())
-            min_icompress = math.log(float(IC.min()) + EPS)
-            max_icompress = math.log(float(IC.max()) + EPS)
+    def _apply_weights_and_unroll(self, extracted: dict, weights: np.ndarray) -> pd.DataFrame:
+        """Score clusters with `weights`, unroll per §4.1, return re-ranked DataFrame."""
+        features   = extracted['features']
+        cluster_nn = extracted['cluster_nn']
+        sim_qd     = extracted['sim_qd']
+        top        = extracted['top'].copy()
+        tail       = extracted['tail']
+        n          = extracted['n']
 
-            # ── lC: P_sw1 (stopword ratio) ────────────────────────────────────
-            SW1 = sw1s[nn]
-            geo_sw1 = float(np.log(SW1 + EPS).mean())
-            min_sw1 = math.log(float(SW1.min()) + EPS)
-            max_sw1 = math.log(float(SW1.max()) + EPS)
+        cluster_scores = features @ weights  # (n,)
 
-            # ── lC: P_sw2 (stopword list coverage) ───────────────────────────
-            SW2 = sw2s[nn]
-            geo_sw2 = float(np.log(SW2 + EPS).mean())
-            min_sw2 = math.log(float(SW2.min()) + EPS)
-            max_sw2 = math.log(float(SW2.max()) + EPS)
-
-            score = (
-                self.w_geo_qsim      * geo_qsim      +
-                self.w_stdv_qsim     * stdv_qsim     +
-                self.w_max_qsim      * max_qsim      +
-                self.w_min_qsim      * min_qsim      +
-                self.w_min_dsim      * min_dsim      +
-                self.w_max_dsim      * max_dsim      +
-                self.w_geo_dsim      * geo_dsim      +
-                self.w_min_icompress * min_icompress +
-                self.w_geo_icompress * geo_icompress +
-                self.w_max_icompress * max_icompress +
-                self.w_geo_entropy   * geo_entropy   +
-                self.w_min_entropy   * min_entropy   +
-                self.w_max_entropy   * max_entropy   +
-                self.w_max_sw2       * max_sw2       +
-                self.w_min_sw2       * min_sw2       +
-                self.w_geo_sw2       * geo_sw2       +
-                self.w_max_sw1       * max_sw1       +
-                self.w_min_sw1       * min_sw1       +
-                self.w_geo_sw1       * geo_sw1
-            )
-
-            # ── Web lC features (active only when doc_features provided) ─────
-            if self._use_web:
-                # P_spam
-                SP = spam_arr[nn]
-                geo_spam = float(np.log(SP + EPS).mean())
-                min_spam = math.log(float(SP.min()) + EPS)
-                max_spam = math.log(float(SP.max()) + EPS)
-
-                # P_pr (raw PageRank; log handles wide dynamic range)
-                PR = pr_arr[nn]
-                geo_pr = float(np.log(PR + EPS).mean())
-                min_pr = math.log(float(PR.min()) + EPS)
-                max_pr = math.log(float(PR.max()) + EPS)
-
-                # P_urlslash
-                US = urlslash_arr[nn]
-                geo_urlslash = float(np.log(US + EPS).mean())
-                min_urlslash = math.log(float(US.min()) + EPS)
-                max_urlslash = math.log(float(US.max()) + EPS)
-
-                # P_urllen
-                UL = urllen_arr[nn]
-                geo_urllen = float(np.log(UL + EPS).mean())
-                min_urllen = math.log(float(UL.min()) + EPS)
-                max_urllen = math.log(float(UL.max()) + EPS)
-
-                score += (
-                    self.w_geo_spam     * geo_spam     +
-                    self.w_min_spam     * min_spam     +
-                    self.w_max_spam     * max_spam     +
-                    self.w_geo_pr       * geo_pr       +
-                    self.w_min_pr       * min_pr       +
-                    self.w_max_pr       * max_pr       +
-                    self.w_geo_urlslash * geo_urlslash +
-                    self.w_min_urlslash * min_urlslash +
-                    self.w_max_urlslash * max_urlslash +
-                    self.w_geo_urllen   * geo_urllen   +
-                    self.w_min_urllen   * min_urllen   +
-                    self.w_max_urllen   * max_urllen
+        # Also add web features if active (weights separate from the 19-vector)
+        if self._use_web:
+            docnos = top["docno"].tolist()
+            df_map = self.doc_features
+            spam_arr     = np.array([df_map.get(d, {}).get("spam",     0.5) for d in docnos])
+            pr_arr       = np.array([df_map.get(d, {}).get("pr",       0.0) for d in docnos])
+            urlslash_arr = np.array([df_map.get(d, {}).get("urlslash", 0.0) for d in docnos])
+            urllen_arr   = np.array([df_map.get(d, {}).get("urllen",   0.0) for d in docnos])
+            for i, nn in enumerate(cluster_nn):
+                SP = spam_arr[nn]; PR = pr_arr[nn]
+                US = urlslash_arr[nn]; UL = urllen_arr[nn]
+                cluster_scores[i] += (
+                    self.w_geo_spam     * float(np.log(SP + EPS).mean())     +
+                    self.w_min_spam     * math.log(float(SP.min()) + EPS)    +
+                    self.w_max_spam     * math.log(float(SP.max()) + EPS)    +
+                    self.w_geo_pr       * float(np.log(PR + EPS).mean())     +
+                    self.w_min_pr       * math.log(float(PR.min()) + EPS)    +
+                    self.w_max_pr       * math.log(float(PR.max()) + EPS)    +
+                    self.w_geo_urlslash * float(np.log(US + EPS).mean())     +
+                    self.w_min_urlslash * math.log(float(US.min()) + EPS)    +
+                    self.w_max_urlslash * math.log(float(US.max()) + EPS)    +
+                    self.w_geo_urllen   * float(np.log(UL + EPS).mean())     +
+                    self.w_min_urllen   * math.log(float(UL.min()) + EPS)    +
+                    self.w_max_urllen   * math.log(float(UL.max()) + EPS)
                 )
 
-            cluster_scores[i] = score
-
-        # ── Cluster → document unrolling (paper §4.1) ────────────────────────
-        # Iterate clusters best→worst.  For each cluster, append its docs
-        # sorted by sim(Q, d) descending, skipping already-placed docs.
+        # Cluster → document unrolling (paper §4.1)
         sorted_centers = np.argsort(cluster_scores)[::-1]
-        seen   = set()
-        result = []
+        seen, result = set(), []
         for ci in sorted_centers:
-            nn = cluster_nn[ci]
-            for j in nn[np.argsort(sim_qd[nn])[::-1]]:
+            for j in cluster_nn[ci][np.argsort(sim_qd[cluster_nn[ci]])[::-1]]:
                 if j not in seen:
-                    result.append(int(j))
-                    seen.add(j)
-        for j in range(n):          # catch any doc not covered (edge case)
+                    result.append(int(j)); seen.add(j)
+        for j in range(n):
             if j not in seen:
                 result.append(j)
 
-        # Assign scores: rank-0 doc gets score=n, rank-(n-1) gets score=1
         new_scores = np.zeros(n)
         for rank, idx in enumerate(result):
             new_scores[idx] = n - rank
 
-        top = top.copy()
         top["score"] = new_scores
         top = top.sort_values("score", ascending=False).reset_index(drop=True)
         top["rank"] = range(1, n + 1)
@@ -622,6 +583,46 @@ class ClustMRF:
             tail["rank"] = range(n + 1, n + len(tail) + 1)
             return pd.concat([top, tail], ignore_index=True)
         return top
+
+    def _rerank_query(self, query: str, docs_df: pd.DataFrame) -> pd.DataFrame:
+        extracted = self._extract_features_for_query(docs_df)
+        if extracted is None:
+            return docs_df
+        return self._apply_weights_and_unroll(extracted, self._weight_vector)
+
+    def transform_features(self, topics_and_res: pd.DataFrame) -> pd.DataFrame:
+        """Extract per-document feature values for all queries without re-ranking.
+
+        Returns a DataFrame with the original qid/docno/rank/score columns plus
+        one column per entry in FEATURE_NAMES, covering the top n_docs documents
+        of each query.  Used by ClustMRFSVMRank for cross-validated weight learning.
+        """
+        groups = [
+            (qid, grp.reset_index(drop=True))
+            for qid, grp in topics_and_res.groupby("qid", sort=False)
+        ]
+        rows = []
+        for qid, grp in groups:
+            extracted = self._extract_features_for_query(grp)
+            if extracted is None:
+                continue
+            top  = extracted['top']
+            feats = extracted['features']
+            for i in range(extracted['n']):
+                r: dict = {
+                    'qid':   str(qid),
+                    'docno': str(top.at[i, 'docno']),
+                    'rank':  int(top.at[i, 'rank']),
+                    'score': float(top.at[i, 'score']),
+                }
+                if 'query' in top.columns:
+                    r['query'] = str(top.at[i, 'query'])
+                if 'text' in top.columns:
+                    r['text'] = str(top.at[i, 'text'])
+                for fi, fname in enumerate(FEATURE_NAMES):
+                    r[fname] = float(feats[i, fi])
+                rows.append(r)
+        return pd.DataFrame(rows)
 
     def transform(self, topics_and_res: pd.DataFrame) -> pd.DataFrame:
         """PyTerrier-compatible transform: re-rank all queries in parallel."""

@@ -35,8 +35,11 @@ sim(Q, d)  = initial retrieval score, softmax-normalised to (0, 1].
 cos_sim    = cosine similarity from stemmed TF-IDF vectors.
 log uses add-ε (= 1e-10) smoothing before application (paper footnote 1).
 
-Non-web default weights are proportional to the feature-importance order
-reported in Table 3 (non-web setting) of Raiber & Kurland 2013.
+Non-web default weights use only lQD/lQC (query-similarity) features.
+The lC features (entropy, icompress, dsim) have unknown sign without
+learning — for news corpora they are often anti-correlated with topical
+relevance, which hurts MAP when given arbitrary positive weights.
+Set lC weights explicitly (or use SVM^rank) if you want them active.
 Web feature weights default to 0.0 (inactive); set them in the constructor
 when using ClueWeb09 collections.  All active weights should sum to 1.0.
 
@@ -255,25 +258,26 @@ class ClustMRF:
         k: int = 5,
         n_docs: int = 100,
         doc_features: dict | None = None,
-        # ── Non-web feature weights (Table 3, non-web setting) ───────────────
+        # ── Non-web feature weights ───────────────────────────────────────────
+        # Importance order (non-web, paper §4.2.2): stdv > geo > max > min qsim.
         # lQD
-        w_geo_qsim:      float = 0.132,
+        w_geo_qsim:      float = 0.30,
         # lQC
-        w_stdv_qsim:     float = 0.143,
-        w_max_qsim:      float = 0.121,
-        w_min_qsim:      float = 0.088,
-        # lC — P_dsim
-        w_min_dsim:      float = 0.110,
-        w_max_dsim:      float = 0.066,
-        w_geo_dsim:      float = 0.055,
-        # lC — P_icompress
-        w_min_icompress: float = 0.099,
-        w_geo_icompress: float = 0.077,
-        w_max_icompress: float = 0.044,
-        # lC — P_entropy
-        w_geo_entropy:   float = 0.033,
-        w_min_entropy:   float = 0.022,
-        w_max_entropy:   float = 0.011,
+        w_stdv_qsim:     float = 0.35,
+        w_max_qsim:      float = 0.25,
+        w_min_qsim:      float = 0.10,
+        # lC — P_dsim  (sign unknown without learning; default off)
+        w_min_dsim:      float = 0.0,
+        w_max_dsim:      float = 0.0,
+        w_geo_dsim:      float = 0.0,
+        # lC — P_icompress  (sign unknown without learning; default off)
+        w_min_icompress: float = 0.0,
+        w_geo_icompress: float = 0.0,
+        w_max_icompress: float = 0.0,
+        # lC — P_entropy  (sign unknown without learning; default off)
+        w_geo_entropy:   float = 0.0,
+        w_min_entropy:   float = 0.0,
+        w_max_entropy:   float = 0.0,
         # ── Web feature weights (all default 0 = inactive) ───────────────────
         # lC — P_spam (Waterloo spam score)
         w_geo_spam:      float = 0.0,

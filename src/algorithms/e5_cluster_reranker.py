@@ -1,22 +1,18 @@
 """
-E5ClusterReranker: cluster-based re-ranking using E5 bi-encoder embeddings.
+E5ClusterReranker: cluster-based re-ranking using dense bi-encoder embeddings.
 
-Two clustering modes, both sharing the same ranking rule:
-  rank clusters by centroid–query cosine similarity (closest first);
-  within each cluster rank passages by individual passage–query cosine similarity;
-  flatten and skip duplicate docnos.
+Two clustering modes:
+  mode='knn'    — each passage is the centre of its k nearest neighbours (overlapping)
+  mode='kmeans' — K-means partitions into k disjoint clusters
 
-mode='knn'  (default)
-  Each passage is the centre of a cluster containing its k-1 nearest neighbours
-  (by E5 cosine similarity) — exactly like ClustMRF but with dense vectors instead
-  of TF-IDF.  Produces n overlapping clusters of size k; duplicates resolved by
-  first-seen rule during unrolling.
+Three centroid types for cluster scoring (centroid · query similarity):
+  centroid_type='mean'          — arithmetic mean of member embeddings, L2-normalised
+  centroid_type='medoid'        — member embedding closest to the arithmetic mean
+  centroid_type='query_weighted'— mean weighted by softmax(passage–query cosine sims)
 
-mode='kmeans'
-  K-means partitions passages into k disjoint clusters.  No duplicate docnos.
-
-Scores are assigned as descending integers (n, n-1, …, 1) to preserve cluster-
-priority ordering for downstream interpolation.
+Clusters are ranked by centroid–query cosine similarity (highest first).
+Within each cluster, passages are ranked by individual passage–query cosine similarity.
+Scores are assigned as descending integers to preserve ordering for interpolation.
 """
 
 from __future__ import annotations
@@ -27,31 +23,55 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
+_VALID_MODES    = ('knn', 'kmeans')
+_VALID_CENTROIDS = ('mean', 'medoid', 'query_weighted')
+
 
 class E5ClusterReranker:
     """
-    Re-ranks passages by clustering their E5 embeddings.
+    Re-ranks passages by clustering their dense bi-encoder embeddings.
 
     Parameters
     ----------
-    model        : HuggingFace AutoModel (e5-base-v2 or compatible).
-    tokenizer    : Matching AutoTokenizer.
-    k            : Neighbourhood size (knn) or number of clusters (kmeans).
-    mode         : 'knn' (default) or 'kmeans'.
-    encode_batch : Tokenisation batch size.
-    device       : 'cuda' | 'cpu' | None (auto-detect).
+    model         : HuggingFace AutoModel.
+    tokenizer     : Matching AutoTokenizer.
+    k             : Neighbourhood size (knn) or number of clusters (kmeans).
+    mode          : 'knn' (default) or 'kmeans'.
+    centroid_type : How to compute the cluster representative used for scoring.
+                    'mean' (default) — arithmetic mean, L2-normalised.
+                    'medoid'         — member whose embedding is closest to the mean.
+                    'query_weighted' — mean weighted by softmax(passage-query sims).
+    query_prefix  : Prefix prepended to the query string before encoding.
+    doc_prefix    : Prefix prepended to each passage string before encoding.
+    encode_batch  : Tokenisation batch size.
+    device        : 'cuda' | 'cpu' | None (auto-detect).
     """
 
-    def __init__(self, model, tokenizer, k: int = 5, mode: str = 'knn',
-                 encode_batch: int = 64, device: str | None = None):
-        if mode not in ('knn', 'kmeans'):
-            raise ValueError("mode must be 'knn' or 'kmeans'")
-        self.tokenizer    = tokenizer
-        self.k            = k
-        self.mode         = mode
-        self.encode_batch = encode_batch
-        self.device       = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model        = model.to(self.device).eval()
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        k: int = 5,
+        mode: str = 'knn',
+        centroid_type: str = 'mean',
+        query_prefix: str = 'query: ',
+        doc_prefix: str = 'passage: ',
+        encode_batch: int = 64,
+        device: str | None = None,
+    ):
+        if mode not in _VALID_MODES:
+            raise ValueError(f"mode must be one of {_VALID_MODES}")
+        if centroid_type not in _VALID_CENTROIDS:
+            raise ValueError(f"centroid_type must be one of {_VALID_CENTROIDS}")
+        self.tokenizer     = tokenizer
+        self.k             = k
+        self.mode          = mode
+        self.centroid_type = centroid_type
+        self.query_prefix  = query_prefix
+        self.doc_prefix    = doc_prefix
+        self.encode_batch  = encode_batch
+        self.device        = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model         = model.to(self.device).eval()
 
     def _encode(self, texts: list[str]) -> np.ndarray:
         enc = self.tokenizer(
@@ -72,7 +92,7 @@ class E5ClusterReranker:
 
     def _build_knn_clusters(self, d_vecs: np.ndarray) -> list[np.ndarray]:
         """Each doc → cluster of its k nearest neighbours (including itself)."""
-        sim = d_vecs @ d_vecs.T   # (n, n) — already L2-normalised
+        sim = d_vecs @ d_vecs.T
         k   = min(self.k, len(d_vecs))
         return [np.argsort(sim[i])[::-1][:k] for i in range(len(d_vecs))]
 
@@ -83,32 +103,50 @@ class E5ClusterReranker:
         labels   = KMeans(n_clusters=k_actual, random_state=42, n_init=10).fit_predict(d_vecs)
         return [np.where(labels == cid)[0] for cid in range(k_actual)]
 
+    def _centroid(
+        self,
+        members: np.ndarray,
+        d_vecs: np.ndarray,
+        passage_sims: np.ndarray,
+    ) -> np.ndarray:
+        """Return a unit-vector representative for the cluster."""
+        if self.centroid_type == 'mean':
+            c    = d_vecs[members].mean(axis=0)
+            norm = np.linalg.norm(c)
+            return c / norm if norm > 1e-9 else c
+
+        if self.centroid_type == 'medoid':
+            mean_c = d_vecs[members].mean(axis=0)
+            dists  = np.linalg.norm(d_vecs[members] - mean_c, axis=1)
+            return d_vecs[members[np.argmin(dists)]]   # already unit-norm
+
+        # query_weighted: softmax of passage–query cosines as mixing weights
+        sims = passage_sims[members].astype(float)
+        w    = np.exp(sims - sims.max())
+        w   /= w.sum()
+        c    = (d_vecs[members] * w[:, None]).sum(axis=0)
+        norm = np.linalg.norm(c)
+        return c / norm if norm > 1e-9 else c
+
     def _rerank_query(self, query_text: str, group: pd.DataFrame) -> pd.DataFrame:
         group = group.reset_index(drop=True)
         docs  = group['text'].fillna('').tolist()
 
-        q_vec  = self._encode(['query: ' + query_text])              # (1, d)
-        d_vecs = self._encode_all(['passage: ' + t for t in docs])   # (n, d)
-
-        passage_sims = (d_vecs @ q_vec.T).squeeze(-1)   # (n,)
+        q_vec        = self._encode([self.query_prefix + query_text])
+        d_vecs       = self._encode_all([self.doc_prefix + t for t in docs])
+        passage_sims = (d_vecs @ q_vec.T).squeeze(-1)
 
         clusters = (self._build_knn_clusters(d_vecs)
                     if self.mode == 'knn'
                     else self._build_kmeans_clusters(d_vecs))
 
-        # Score each cluster by normalised-centroid · query
-        q = q_vec[0]                         # (d,) — avoid shape issues with q_vec.T
-        centroid_sims = []
-        for members in clusters:
-            c     = d_vecs[members].mean(axis=0)
-            norm  = np.linalg.norm(c)
-            c_hat = c / norm if norm > 1e-9 else c
-            centroid_sims.append(float(c_hat @ q))
-
+        q = q_vec[0]
+        centroid_sims = [
+            float(self._centroid(members, d_vecs, passage_sims) @ q)
+            for members in clusters
+        ]
         cluster_order = np.argsort(centroid_sims)[::-1]
 
-        # Unroll: best cluster first; within cluster best passage-query sim first;
-        # skip already-placed docnos (critical for knn where clusters overlap).
         ranked_indices: list[int] = []
         seen_docnos: set[str]     = set()
         for ci in cluster_order:
@@ -127,7 +165,10 @@ class E5ClusterReranker:
     def transform(self, run_df: pd.DataFrame) -> pd.DataFrame:
         query_col = 'query_0' if 'query_0' in run_df.columns else 'query'
         results   = []
-        for qid, group in tqdm(run_df.groupby('qid'),
-                               desc=f'E5-cluster rerank ({self.mode})', leave=True):
+        for qid, group in tqdm(
+            run_df.groupby('qid'),
+            desc=f'ClusterRerank ({self.mode}, {self.centroid_type})',
+            leave=True,
+        ):
             results.append(self._rerank_query(str(group[query_col].iloc[0]), group))
         return pd.concat(results, ignore_index=True)
